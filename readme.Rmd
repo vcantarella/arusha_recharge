@@ -1,0 +1,483 @@
+---
+title: "Assignment Arusha"
+description: |
+  Recharge Estimation under current and future climate conditions.
+author:
+  - name: Vitor Cantarella 
+    url: vcantarella@gmail.com
+    affiliation: GroundwatCH - IHE Delft
+date: "`r Sys.Date()`"
+output:
+  distill::distill_article:
+    toc: true
+    toc_depth: 2
+    keep_md: yes
+bibliography: Bibliography.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(reticulate)
+use_condaenv(condaenv = "qgispcraster")
+
+```
+
+# Introduction
+
+The present report summarizes the calculations and assumptions taken to model recharge in Arusha, Tanzania, in under different landuse and climate conditions.
+We briefly discuss the results with emphasis for adaptation under climate change.
+
+The available data includes:
+
+- one precipitation station with one year of precipitation values, year 2020
+- one evapotranspiration station with one year o reference evapotranspiration values, year 2020
+- land use map for the years 1995, 2020 and 2050.
+- soil map
+- simple transformation for precipitation (higher intensity, less frequency) and evapotranspiration (higher intensity) for the year 2050.
+- annual runoff per land use values used for calibration.
+
+# Basic Assumptions
+
+The recharge model is based on a simplified version of the Water Balance Model and it is an implementation of the recharge excel workbook model(Nonner & Stigter, 2015)
+The report is an adaptation to the one submitted for completion of IHE lecture in Groundwater and Climate Change.
+The novelty of this project is the adaptation of the class excel worksheet to PCRaster [@RN44] framework.
+
+The framework allows the implementation of distributed model with speed. In comparison to the class assignment, where each class must be computed in a new worksheet, here everything is done seemslesly in one script.
+
+The integration in the python environment and open source community also allow us to use the full output for spatial analysis and further modelling, such as integration with groundwater modelling.
+
+The model is built on top of the Dynamic Model framework from PCRaster [@RN44] and it is available in the script: ```dynamic_model.py```. 
+
+The parameters used as input are detailed below.
+
+## Parameters
+
+We have estimated parameters for the water balance model comparing the available land-use and soil classifications with data from the literature.
+
+Additionally, we have calibrated the runoff threshold parameter with the runoff per land-use data supplied in the assignment.
+
+### Available water
+
+The total available water parameter was estimated based on the paper [@RN45], where a graph of field capacity and permanent wilting point for various soils are present.
+
+The available water is estimated by the expression:
+
+$$AW = FC - WP$$
+
+where $AW$ is the available water, $FC$ is the field capacity and $WP$ is the wilting point. All units are fractions of the soil volume.
+
+The estimated results are the following:
+
+```{r}
+library(tidyverse)
+library(knitr)
+tab = read_delim("Other input/soil_cap.tbl", delim = " ", col_names = F)
+names(tab) = c("soil code", "Available Water")
+tab = tab %>% 
+  mutate(`Soil Type` = c("Sandy Clay", "Silty Sand")) %>% 
+  select(`Soil Type`, `soil code`, `Available Water`)
+kable(tab, caption = "Available water table")
+```
+
+#### Initial TAW
+
+For the start of the simulation, the initial water content in every cell was 50% of the TAW for that cell.
+
+### Soil Root Depth
+
+In our simplified unsaturated soil water balance model, the soil is modeled only down to the maximum root depth of each vegetation. Water that is driven below that depth is computed as groundwater recharge.
+
+The depths were assigned to each landuse based on values tabulated in the Wetspass-M model [@RN43]. Table \@ref:(tab:tab-root) contains the estimations.
+
+
+```{r tab-root }
+library(tidyverse)
+library(knitr)
+tab = read_delim("Other input/soil_ext_depth.tbl", delim = " ", col_names = F)
+names(tab) = c("land use code", "Root Depth (mm)")
+tab = tab %>% 
+  mutate(`Land Use Type` = c("Urban", "Agriculture","Deciduous forest","Coniferous tree","Mixed forest","Shrub/Grassland", "Sparsely vegetated")) %>% 
+  select(`Land Use Type`, `land use code`, `Root Depth (mm)`)
+kable(tab, caption = "Root depth for every Land Use")
+```
+
+### Crop factor
+
+Crop factor is the parameter for calculating the potential evapotranspiration of each land-use, based on the supplied reference evapotranspiration. According to [@RN46], the expression for the calculation is:
+
+$$PET = K_c*RET $$
+$PET$: Potential Evapotranspiration
+
+$Kc$: Crop factor
+$RET$: Reference Evapotranspiration
+
+Values were estimated based on the values tabulated in Wetspass-M [@RN43] and values in the FAO guidelines for the Penman-Monteith model [@RN46]. The results are in the Table \@ref(tab:crop-tab).
+
+
+
+```{r crop-tab }
+library(tidyverse)
+library(knitr)
+tab = read_delim("Other input/crop_coef.tbl", delim = " ", col_names = F)
+names(tab) = c("land use code", "Crop Coef.")
+tab = tab %>% 
+  mutate(`Land Use Type` = c("Urban", "Agriculture","Deciduous forest","Coniferous tree","Mixed forest","Shrub/Grassland", "Sparsely vegetated")) %>% 
+  select(`Land Use Type`, `land use code`, `Crop Coef.`)
+kable(tab, caption = "Crop factor values adopted for each landuse type in the model")
+```
+
+### Readily Available Water
+
+According to [@RN46], evapotranspiration under water-stress conditions can be modelled by the readily available water (RAW), which is used to calculate the water stress coefficient (Figure \@ref(fig:ks)).
+
+```{r ks, fig.cap = "Water stress coefficient as a function of soil water [@RN46]"}
+
+knitr::include_graphics("ks.png")
+```
+
+In the PCRaster Recharge model, the water stress coefficient is modelled indirectly, as the assigment's excel sheet, using the RAW parameter.
+
+The RAW parameter is estimated as 50 % of the TAW for all soil and land-use types. This estimation is a common value for many crops [@RN46]
+
+### Runoff threshold
+
+In the model, runoff refers to the overland flow from precipitation.
+
+The runoff is modelled by a threshold for precipitation intensity. The model assigns precipitation that exceeds a given threshold as runoff. Rainfall below the threshold infiltrates the soil zone.
+
+Values for threshold were calibrated for each land use by running the model in 2020 and verifying the model runoff to the given values. Here we use PCRaster for analysis of the total runoff of each land use. The table with calibrated and given values is displayed below.
+
+```{python, echo = TRUE, include = FALSE}
+from dynamic_model import RechargeModel
+import os
+from pcraster import *
+from pcraster.framework import *
+
+land_use_folder = "LULC Input"
+mymodel = RechargeModel(os.path.join(land_use_folder,"2020_Landuse"), "20")
+dynModelFw = DynamicFramework(mymodel, lastTimeStep=366, firstTimestep=1)
+dynModelFw.run()
+
+#Check calibration:
+land_use_folder = "LULC Input"
+land_use = readmap(os.path.join(land_use_folder, "2020_Landuse"))
+Urban = land_use == 1
+Shrub = land_use == 36
+Mixed = land_use == 33
+Agr = land_use == 21
+Forest = land_use == 31
+Coniferous = land_use == 32
+Sparse_veg = land_use == 307
+acc_runoff = readmap(os.path.join("output", "a_r_2000.366"))
+def run_off_bool(runoff, boolean):
+    runoff = ifthenelse(boolean, runoff, scalar(0))
+    runoff = maptotal(runoff)*(250**2)
+    runoff = pcr2numpy(runoff,-10)
+    runoff = runoff[runoff >= 0]
+    runoff = runoff[0]
+    area = ifthenelse(boolean, scalar(1),scalar(0))
+    area = maptotal(area)*250**2
+    area = pcr2numpy(area,-10)
+    area = area[area > 0]
+    area = area[0]
+    return runoff/area
+
+
+avg_urban = run_off_bool(acc_runoff, Urban)
+avg_shrub = run_off_bool(acc_runoff, Shrub)
+avg_mix = run_off_bool(acc_runoff, Mixed)
+avg_agr = run_off_bool(acc_runoff, Agr)
+avg_for = run_off_bool(acc_runoff, Forest)
+avg_con = run_off_bool(acc_runoff, Coniferous)
+avg_sparse = run_off_bool(acc_runoff, Sparse_veg)
+
+import numpy as np
+
+array = np.array([avg_urban,avg_shrub,avg_mix,avg_agr,avg_for,avg_con,avg_sparse])
+
+
+import pandas as pd
+
+
+Land_list = ["urban","shrub", 'mixed_forest',"agriculture", "forest", 'coniferous', 'sparse_vegetation']
+No = np.array([1,36,33,21,31,32, 307])
+
+df = pd.DataFrame({"Land_Use": Land_list, "Runoff": array, "No" : No})
+df
+
+tab_calib = pd.read_csv(os.path.join("Other input", "runoff2020.csv"))
+tab_calib.head()
+
+
+df = pd.merge(df, tab_calib, how = "left", on = "No")
+
+import os
+
+#df.to_csv(os.path.join("output","calibration_table.csv"))
+
+```
+
+
+
+
+
+```{r lan-tab}
+library(tidyverse)
+library(knitr)
+tab = read_delim("Other input/land_use_threshold.tbl", delim = " ", col_names = F)
+names(tab) = c("land use code", "Runoff Threshold (mm)")
+tab = tab %>% 
+  mutate(`Land Use Type` = c("Urban", "Agriculture","Deciduous forest","Coniferous tree","Mixed forest","Shrub/Grassland", "Sparsely vegetated")) %>% 
+  select(`Land Use Type`, `land use code`, `Runoff Threshold (mm)`)
+tab_calib = read_csv("output/calibration_table.csv")
+names(tab_calib) = c("X0", "Land Use Type","Runoff-measured","land use code","lixo_var", "Avg runoff (mm)", "Min runoff (mm)", "Max runoff (mm)")
+tab = tab %>% left_join(tab_calib %>% select(-`Land Use Type`) %>% select(-X0) %>% select(-lixo_var), by = "land use code")
+kable(tab, digits = 1, caption = "Runoff Threshold parameters for each landuse type in the model")
+```
+
+## Tasks
+
+We will now procede by answering the assignment's questions.
+
+### Recharge estimation as function of land use change
+
+```{python, include=FALSE}
+from dynamic_model import RechargeModel
+import os
+from pcraster import *
+from pcraster.framework import *
+import numpy as np
+
+land_use_folder = "LULC Input"
+landuse_maps = []
+
+for file in os.listdir(land_use_folder):
+    if file.endswith(".map"):
+        file = file.replace('.map',"")
+        landuse_maps.append(file)
+
+recharge_results = []
+recharge_year = []
+
+for file in landuse_maps:
+  mymodel = RechargeModel(os.path.join(land_use_folder, file), "20")
+  dynModelFw = DynamicFramework(mymodel, lastTimeStep=366, firstTimestep=1)
+  dynModelFw.run()
+  
+  recharge = np.array(mymodel.recharge_list)
+
+  recharge = np.sum(recharge)
+  recharge_results.append(recharge)
+  if mymodel.year == '95':
+    year = '19'+mymodel.year
+  else:
+    year = '20'+mymodel.year
+  recharge_year.append(year)
+
+import pandas as pd
+
+df = pd.DataFrame({"Year": recharge_year,"Recharge (mm)": recharge_results})
+df.to_csv("recharge_tab.csv",index = False)
+```
+
+```{r rech-lan}
+tab = read_csv("recharge_tab.csv")
+kable(tab,digits = 2, caption = "Recharge as function of the predicted land use change")
+```
+
+The results for the recharge indicate little variation due to change in land use for the Arusha catchment. This is related to the fact that the recharge calculated by urban areas is not very different from the recharge of areas with poor vegetation and agriculture.
+
+
+
+This behaviour of the model is due to the fact that the urbanization in Arusha, from interpretation of the aerial photographs, does not cause significant impermeabilization of the soil, except for the highly urbanized downtown. Much of the city area is located under unpaved roads and houses with clear terrain. Therefore, expansion of the city only alters recharge slightly.
+
+### Recharge Estimation Under Climate Change
+
+```{python, include = FALSE}
+from dynamic_model import RechargeModel
+import os
+from pcraster import *
+from pcraster.framework import *
+import numpy as np
+
+land_use_folder = "LULC Input"
+landuse_maps = ["1995_Landuse","2050_Landuse"]
+years = ['20','50']
+
+recharge_results = []
+recharge_year = []
+
+for i in range(len(landuse_maps)):
+  file = landuse_maps[i]
+  year = years[i]
+  mymodel = RechargeModel(os.path.join(land_use_folder, file), year)
+  dynModelFw = DynamicFramework(mymodel, lastTimeStep=366, firstTimestep=1)
+  dynModelFw.run()
+  
+  recharge = np.array(mymodel.recharge_list)
+
+  recharge = np.sum(recharge)
+  recharge_results.append(recharge)
+  if mymodel.year == '95':
+    year = '19'+mymodel.year
+  else:
+    year = '20'+mymodel.year
+  recharge_year.append(year)
+
+import pandas as pd
+
+df = pd.DataFrame({"Year": recharge_year,"Recharge (mm)": recharge_results})
+df.to_csv("recharge_tab.csv",index = False)
+```
+
+```{r rech-lan-clim}
+tab = read_csv("recharge_tab.csv")
+kable(tab, digits = 2, caption = "Recharge as function of the predicted land use change and climate change")
+```
+
+We see a large numerical difference between the values from Table \@ref(tab:rech-lan) and Table \@ref(tab:rech-lan-clim). This is due to the lower threshold in the Urban Area. Since the Urban area has limited infiltration capacity, the heavy rainfall predicted under climate change will mainly generate runoff, and it will impact groundwater recharge.
+
+### Water abstractions compared with groundwater recharge
+
+The assignment assigns a population growth model of 1.5 % per year for the calculation of the abstraction demand. This can be represented by the formula below:
+
+$$ P_{2020}*(1+0.015)^{n_{years}} $$
+
+Where $P_{2020}$ is the population in 2020 and $n_{years}$ is the number of years in 2020 and in 2050.
+
+Therefore we have a population and water demands for 1995, 2020 and 2050:
+
+```{python, include = FALSE}
+#Get the abstraction rates per cell:
+
+import numpy as np
+from pcraster import *
+from pcraster.framework import *
+
+land_use_folder = "LULC Input"
+landuse_maps = ["1995_Landuse","2020_Landuse","2050_Landuse"]
+years = [1995,2020,2050]
+
+population_ls = []
+abstraction_rate = []
+abs_rate_cell = []
+recharge_acc = []
+abs_recharge = []
+
+
+def area_boolean(mapa):
+    area = ifthenelse(mapa, scalar(1),scalar(0))
+    area = maptotal(area)*250**2
+    area = pcr2numpy(area,-10)
+    area = area[area > 0]
+    area = area[0]
+    return area
+  
+for i in range(len(landuse_maps)):
+  mapa = readmap(os.path.join(land_use_folder, landuse_maps[i]+'.map'))
+  mapa = mapa == 1
+  area = area_boolean(mapa)
+  population = 324000*(1+0.015)**(years[i]-2020)
+  population_ls.append(population)
+  HH = (population/4*0.18*0.77)*0.18+3300
+  abstraction_rate.append(HH*365*1e-6)
+  HH_per_cell = (HH/area)*1000*365
+  abs_rate_cell.append(HH_per_cell)
+  
+  print("The Urban Area for the year "+str(years[i])+" is {0:10.0f} m2,\nthe total abstraction is {1:6.0f} m3,\nand the abstraction per urban cell is {2:4.3f} mm"\
+      .format(area,HH*365,HH_per_cell))
+  year_model = re.search(r'\d{2}$',str(years[i]))[0]
+  if year_model == '95':
+    year_model = '20'
+  mymodel = RechargeModel(os.path.join(land_use_folder, landuse_maps[i]), year_model)
+  dynModelFw = DynamicFramework(mymodel, lastTimeStep=366, firstTimestep=1)
+  dynModelFw.run()
+  
+  recharge = np.array(mymodel.recharge_list)
+
+  recharge = np.sum(recharge)
+  recharge_acc.append(recharge)
+  recharge_map = readmap(os.path.join('output','a_r_'+mymodel.year+'00.366'))
+  area_recharge = maparea(recharge_map)
+  area_recharge = pcr2numpy(area_recharge,-10)
+  area_recharge = area_recharge[50,50]
+  total_recharge = area_recharge*recharge*1000
+  abs_recharge.append(HH*365/total_recharge*100)
+  
+  print("The Total Area for the yea r"+str(years[i])+" is {0:10.0f} m2,\nthe total recharge per day is {1:6.0f} m3,\nand the areal recharge per is {2:4.3f} mm"\
+      .format(area_recharge,total_recharge,recharge))
+  print("The Total recharge is {0:10.0f} m3,\nand the percentage of recharge is: {1:2.0f} %".format(total_recharge,HH*365/total_recharge*100))
+  
+df = pd.DataFrame({"Year": years,'Population': population_ls, "Net Abstraction (Mm3)": abstraction_rate,"Abs per Urban Cell (mm)": abs_rate_cell ,"Recharge (mm)": recharge_acc, "Percentage of Recharge Abstracted (%)": abs_recharge})
+df.to_csv("df_abstraction.csv",index = False)
+```
+```{r net-abs}
+tab = read_csv("df_abstraction.csv")
+kable(tab, digits = 2, caption = "Net Abstraction Calculations and Comparison to Recharge")
+```
+
+Table \@ref(tab:net-abs) summarises the calculated net abstractions and derived quantities. The results suggests that abstraction is sustainable, as the rates are very low compared to recharge.
+
+Another interesting result from Table \@ref(tab:net-abs) is that although the Net abstraction is increasing, the expansion of the city is increasing at a higher rate, and the overall results is a decrease in abstraction per cell.
+
+
+### Groundwater Drop due to change in Steady-state conditions
+
+To estimate the groundwater drop due to urbanization and climate-change, a few assumptions were made.
+
+* The current scenario, in 2020 is in steady-state. This is necessary for the simplified assumption in the next step.
+
+* The scenario in 2050 is the endmember scenario and the change in groundwater fluxes is linear with time. This means that we can compute the fluxes from initial scenario and from the last scenario and the average change in storage per year will be half of the difference between those fluxes. Multiplying by the number of years we get the change in storage:
+
+$$ \Delta S = \frac{GW_{2050}-GW_{2020}}{2}*t_{years} $$
+
+* The groundwater fluxes inside the aquifer are ignored
+
+* The groundwater drop was calculated as the initial groundwater heads in 2020 plus the change in storage in m of aquifer.
+
+$$Heads_{final} = Heads_{initial}+\Delta{S}/Sy $$
+
+```{python drop-hed, echo = FALSE, warning = FALSE, out.width = "200%", fig.cap = "Estimated Drop in groundwater heads, in meters"}
+
+import numpy as np
+from pcraster import *
+from pcraster.framework import *
+
+map_2020 = readmap(os.path.join('output','a_r_2000.366'))
+map_2050 = readmap(os.path.join('output','a_r_5000.366'))
+bool_2020 = map_2020 == 0
+bool_2050 = map_2050 == 0
+map_2020 = ifthenelse(bool_2020, scalar(-26.09), map_2020)
+map_2050 = ifthenelse(bool_2050, scalar(-18.62), map_2050)
+
+difference = map_2050-map_2020
+
+
+gwheads_initial = readmap(os.path.join("Other input","gwheads.map"))
+
+gwheads_final = gwheads_initial - difference*1e-3/2*30/0.1
+
+storage_difference = gwheads_final - gwheads_initial
+
+plot(storage_difference, title = "Drop in Groundwater Heads")
+
+avg_change = maptotal(storage_difference)/(maparea(storage_difference)/250**2)
+avg_change = pcr2numpy(avg_change,-9999)
+avg_change = avg_change[50,50]
+print('The predicted average change in groundwater heads in the 30 year period (2020-2050) is of {0:6.0f} meters'.format(avg_change))
+```
+
+The figure \@ref(fig:drop-hed) shows the predicted head drop in meters for the Arusha aquifer. The major drops are related to areas where new cities are predicted, with values around 50 m. In the current city the drop is predicted to around 25 m, while in the natural landscape, to - 10 m.
+
+The maps shows the importance of managing the land for groundwater. Unrestricted growth will severely impact groundwater heads, specially in the urban area.
+
+The average head drop predition is of 24 meters.
+
+## Sustainability of Abstractions
+
+As seen in the table \@ref(tab:net-abs), abstractions are very low compared to recharge. Therefore, I would conclude the abstractions are sustainable.
+
+On the other hand, the unplanned expansion of the Urban Area pose a major threat to sustainability, as the recharge will be severely impacted, specially under climate change scenarios.
+
+
+
